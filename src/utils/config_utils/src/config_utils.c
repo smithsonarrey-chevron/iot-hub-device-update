@@ -14,6 +14,7 @@
 #include <aducpal/stdlib.h> // setenv
 #include <azure_c_shared_utility/crt_abstractions.h>
 #include <azure_c_shared_utility/strings_types.h>
+#include <errno.h>
 #include <parson.h>
 #include <parson_json_utils.h>
 #include <pthread.h>
@@ -57,12 +58,97 @@ static const char* CONFIG_RUN_AS = "runas";
 static const char* CONFIG_CONNECTION_SOURCE = "connectionSource";
 static const char* CONFIG_CONNECTION_TYPE = "connectionType";
 static const char* CONFIG_CONNECTION_DATA = "connectionData";
+static const char* CONFIG_CONNECTION_X509_CERT_FILE_PATH = "connectionX509CertFilePath";
+static const char* CONFIG_CONNECTION_X509_PRIVATE_KEY_FILE_PATH = "connectionX509PrivateKeyFilePath";
+static const char* CONFIG_CONNECTION_X509_CA_CERT_FILE_PATH = "connectionX509CaCertFilePath";
 static const char* CONFIG_ADDITIONAL_DEVICE_PROPERTIES = "additionalDeviceProperties";
 static const char* CONFIG_AGENTS = "agents";
 
 static const char* INVALID_OR_MISSING_FIELD_ERROR_FMT = "Invalid json - '%s' missing or incorrect";
 
 static void ADUC_AgentInfo_Free(ADUC_AgentInfo* agent);
+
+static char* ADUC_AgentInfo_Read_X509_File(const char* const x509_file_path)
+{
+    char* buffer = NULL;
+    long ftellResult = 0;
+    size_t bufferLength = 0;
+    size_t bytesRead = 0;
+    FILE* x509File = NULL;
+    bool success = false;
+
+    x509File = fopen(x509_file_path, "rb");
+    if (x509File == NULL)
+    {
+        Log_Error("Failed to open '%s'!", x509_file_path);
+        goto done;
+    }
+
+    if (fseek(x509File, 0, SEEK_END) != 0)
+    {
+        Log_Error("Failed to seek end of '%s'!", x509_file_path);
+        goto done;
+    }
+
+    ftellResult = ftell(x509File);
+    if (ftellResult == -1)
+    {
+        Log_Error("Failed to get file position ('%d')!", errno);
+        goto done;
+    }
+
+    bufferLength = (size_t)ftellResult;
+    if (fseek(x509File, 0, SEEK_SET) != 0)
+    {
+        Log_Error("Failed to seek begin of '%s'!", x509_file_path);
+        goto done;
+    }
+
+    buffer = malloc(bufferLength);
+    if (buffer == NULL)
+    {
+        Log_Error("Failed to get memory for buffer!");
+        goto done;
+    }
+
+    bytesRead = fread(buffer, 1, bufferLength, x509File);
+    if (bytesRead < bufferLength)
+    {
+        if (feof(x509File))
+        {
+            Log_Error("Unexpected end of file while reading '%s' (bytesRead: %zu)!", x509_file_path, bytesRead);
+        }
+        else if (ferror(x509File))
+        {
+            Log_Error("Error occurred while reading '%s' (bytesRead: %zu)!", x509_file_path, bytesRead);
+        }
+        else
+        {
+            Log_Error("Failed to read '%s' (bytesRead: %zu)!", x509_file_path, bytesRead);
+        }
+
+        goto done;
+    }
+
+    success = true;
+
+done:
+    if (!success)
+    {
+        free(buffer);
+        buffer = NULL;
+    }
+
+    if (x509File != NULL)
+    {
+        if (fclose(x509File) != 0)
+        {
+            Log_Warn("Failed to close '%s'!", x509_file_path);
+        }
+    }
+
+    return buffer;
+}
 
 /**
  * @brief Initializes an ADUC_AgentInfo object
@@ -94,6 +180,9 @@ static bool ADUC_AgentInfo_Init(ADUC_AgentInfo* agent, const JSON_Object* agent_
     JSON_Object* connection_source = json_object_get_object(agent_obj, CONFIG_CONNECTION_SOURCE);
     const char* connection_type = NULL;
     const char* connection_data = NULL;
+    const char* connection_x509_cert_file_path = NULL;
+    const char* connection_x509_private_key_file_path = NULL;
+    const char* connection_x509_ca_cert_file_path = NULL;
 
     if (connection_source == NULL)
     {
@@ -102,6 +191,11 @@ static bool ADUC_AgentInfo_Init(ADUC_AgentInfo* agent, const JSON_Object* agent_
 
     connection_type = json_object_get_string(connection_source, CONFIG_CONNECTION_TYPE);
     connection_data = json_object_get_string(connection_source, CONFIG_CONNECTION_DATA);
+    connection_x509_cert_file_path = json_object_get_string(connection_source, CONFIG_CONNECTION_X509_CERT_FILE_PATH);
+    connection_x509_private_key_file_path =
+        json_object_get_string(connection_source, CONFIG_CONNECTION_X509_PRIVATE_KEY_FILE_PATH);
+    connection_x509_ca_cert_file_path =
+        json_object_get_string(connection_source, CONFIG_CONNECTION_X509_CA_CERT_FILE_PATH);
 
     // As these fields are mandatory, if any of the fields doesn't exist, the agent will fail to be constructed.
     if (name == NULL || runas == NULL || connection_type == NULL || connection_data == NULL || manufacturer == NULL
@@ -128,6 +222,34 @@ static bool ADUC_AgentInfo_Init(ADUC_AgentInfo* agent, const JSON_Object* agent_
     if (mallocAndStrcpy_s(&(agent->connectionData), connection_data) != 0)
     {
         goto done;
+    }
+
+    if (connection_x509_cert_file_path || connection_x509_private_key_file_path || connection_x509_ca_cert_file_path)
+    {
+        if (connection_x509_cert_file_path && connection_x509_private_key_file_path
+            && connection_x509_ca_cert_file_path)
+        {
+            agent->x509Cert = ADUC_AgentInfo_Read_X509_File(connection_x509_cert_file_path);
+            if (!agent->x509Cert)
+            {
+                goto done;
+            }
+            agent->x509PrivateKey = ADUC_AgentInfo_Read_X509_File(connection_x509_private_key_file_path);
+            if (!agent->x509PrivateKey)
+            {
+                goto done;
+            }
+            agent->x509CaCert = ADUC_AgentInfo_Read_X509_File(connection_x509_ca_cert_file_path);
+            if (!agent->x509CaCert)
+            {
+                goto done;
+            }
+        }
+        else
+        {
+            Log_Error(
+                "Incomplete X509 client certificate configuration! Cert file path or private key file path is missing.");
+        }
     }
 
     if (mallocAndStrcpy_s(&(agent->manufacturer), manufacturer) != 0)
@@ -172,6 +294,15 @@ static void ADUC_AgentInfo_Free(ADUC_AgentInfo* agent)
 
     free(agent->connectionData);
     agent->connectionData = NULL;
+
+    free(agent->x509Cert);
+    agent->x509Cert = NULL;
+
+    free(agent->x509PrivateKey);
+    agent->x509PrivateKey = NULL;
+
+    free(agent->x509CaCert);
+    agent->x509CaCert = NULL;
 
     free(agent->manufacturer);
     agent->manufacturer = NULL;
