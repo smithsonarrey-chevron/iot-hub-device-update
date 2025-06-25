@@ -334,7 +334,7 @@ set (
 
 set (
     ADUC_LOG_FOLDER
-    "/var/log/adu"
+    "/var/log/updates"
     CACHE STRING "Location where ADU Agent will write logs.")
 
 set (
